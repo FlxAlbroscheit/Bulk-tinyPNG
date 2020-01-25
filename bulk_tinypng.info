@@ -1,0 +1,6 @@
+name = Bulk TinyPNG
+description = Implements tinyPNG and fileEntity to provide mass compression of images via fileEntity UI
+core = 7.x
+;configure = admin/config/modules/bulk_tinypng
+dependencies[] = tinypng
+dependencies[] = file_entity

@@ -1,0 +1,195 @@
+<?php
+/**
+ * Bulk tinyPNG
+ *
+ * Implements tinyPNG and fileEntity to provide mass compression of 
+ * images via fileEntity UI.
+ *
+ * @author Felix Albroscheit
+ * @version 1.0.0
+ * @license GNU GENERAL PUBLIC LICENSE (Version 2, June 1991)
+ * @thanks file_entity/file_entity.admin.inc
+ *
+ * @todo Skip already tinified images (needs a new field on file entity, see _bulk_tinypng_update_image)
+ * @todo Refactor percentage calculation
+ */
+
+/**
+ * Implements hook_file_operations().
+ */
+function bulk_tinypng_file_operations() {
+  return array(
+    'bulk_tinypng_mass_compress' => array(
+      'label' => t('Compress selected files (non-images will be skipped)'),
+      'callback' => 'bulk_tinypng_mass_compress',
+      'callback arguments' => null
+    )
+  );
+}
+
+/**
+ * Make mass compression of files.
+ *
+ * Update all files in the $files array with a compressed version of their image
+ * Auto-skips files that are not image/[jp[e]g||png] or have already been compressed before
+ *
+ * IMPORTANT NOTE: This function is intended to work when called
+ * from a form submit handler. Calling it outside of the form submission
+ * process may not work correctly.
+ *
+ * @param array $files
+ *   Array of file fids to update.
+ */
+function bulk_tinypng_mass_compress(array $files) {
+
+    $batch = array(
+      'operations' => array(
+        array(
+          '_bulk_tinypng_mass_compress_batch_process',
+          array($files),
+        ),
+      ),
+      'finished' => '_bulk_tinypng_mass_compress_batch_finished',
+      'title' => t('Processing'),
+      // We use a single multi-pass operation, so the default
+      // 'Remaining x of y operations' message would be confusing here (e.g. "Finished 0 out of 1").
+      'progress_message' => '',
+      'error_message' => t('The update has encountered an error.'),
+    );
+
+    batch_set($batch);
+}
+
+/**
+ * Apply tinyPNG-compression (or fallback) on selected file
+ * 
+ * @param $file
+    A file object.
+ * @return
+    Object: Upladed file with original and new filesize
+ */
+function _bulk_tinypng_update_image(stdClass $file) {
+
+  /*if (!field_info_field('original_filesize')) {
+   // @todo On install, add a new field of type integer to save previous and new filesize, display the compression yield (in percentage) on file entity list and skip bulk actions for already compressed images
+   // &&  if (!field_info_instance($title_text_instance['entity_type'], $title_text_instance['field_name'], $title_text_instance['bundle'])) {
+    $field = array( 
+      'field_name' => 'original_filesize',
+      'type' => 'number_integer',
+      'module' => 'number',      //'locked' => TRUE,
+      'settings' => array(
+        'no_ui' => TRUE, // Field is not visible in field UI and can only be instantiated programmatically.
+      ),
+    );
+
+    field_create_field($field);
+
+    $instance = array(
+        'field_name' => 'original_filesize',
+        'entity_type' => 'file',
+        'bundle' => 'image',
+        'required' => FALSE,
+      );
+
+    field_create_instance($instance);
+  }
+  */
+
+  $tinypng_image = new stdClass();
+  
+  $tinypng_image->info = [
+    'mime_type' => $file->filemime
+  ];
+
+  //$file->original_filesize = @todo;
+
+  $new_filesize = image_tinypng_save($tinypng_image, $file->uri);
+
+  $file->filesize = $new_filesize;
+
+  file_save($file);
+
+  return $file;
+}
+
+/**
+ * File Mass Compress Batch operation.
+ */
+function _bulk_tinypng_mass_compress_batch_process($files, &$context) {
+
+  if (!isset($context['sandbox']['progress'])) {
+    $context['sandbox']['progress'] = 0;
+    $context['sandbox']['max'] = count($files);
+    $context['sandbox']['files'] = $files;
+  }
+
+  // Process files by groups of 5.
+  $count = min(5, count($context['sandbox']['files']));
+
+  for ($i = 1; $i <= $count; $i++) {
+    // For each fid, load the file, reset the values, and save it.
+    $file_id = array_shift($context['sandbox']['files']);
+
+    $file = file_load($file_id);
+
+    $supported_file_types = array(
+      'image/png',
+      'image/jpg',
+      'image/jpeg',
+    );
+
+    if (!in_array($file->filemime, $supported_file_types)) {
+      $context['results'][] = t('Skipped') . ': ' . l($file->filename, 'file/' . $file->fid) . ' (UNSUPPORTED_FILE_TYPE: ' . $file->filemime . ')';
+
+    // @todo else if (!empty($file->uncompressed_file_size)) // / ->compressed_at
+    } else {
+      $old_filesize = $file->filesize;
+
+      $file = _bulk_tinypng_update_image($file);
+
+      $new_filesize = $file->filesize;
+      
+      // @todo More precise percentage calculation
+      $diff_filesize_percent = $old_filesize !== $new_filesize
+                               ? intval($old_filesize / $new_filesize * 1)
+                               : 0;
+
+      // Store result for post-processing in the finished callback.
+      $message = l($file->filename, 'file/' . $file->fid);
+
+      if ($diff_filesize_percent > 0) {
+        $message .= t(' - Compressed by @percent% (@old_filesize -> @new_filesize)', array(
+          '@percent' => $diff_filesize_percent,
+          '@old_filesize' => format_size($old_filesize),
+          '@new_filesize' => format_size($new_filesize)
+        ));
+      }
+
+      $context['results'][] = $message;
+
+    }
+
+    // Update our progress information.
+    $context['sandbox']['progress']++;
+  }
+
+  // Inform the batch engine that we are not finished,
+  // and provide an estimation of the completion level we reached.
+  if ($context['sandbox']['progress'] != $context['sandbox']['max']) {
+    $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['max'];
+  }
+}
+
+/**
+ * Mass compress Batch 'finished' callback.
+ */
+function _bulk_tinypng_mass_compress_batch_finished($success, $results, $operations) {
+
+  if ($success) {
+    $message = format_plural(count($results), '1 item successfully processed:', '@count items successfully processed:');
+    $message .= theme('item_list', array('items' => $results));
+    drupal_set_message($message);
+  } else {
+    drupal_set_message(t('An error occurred and processing did not complete.'), 'error');
+  }
+}
